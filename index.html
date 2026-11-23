@@ -296,6 +296,9 @@ select.sel {
 .seg span { display: block; text-align: center; padding: 7px 4px; border-radius: 7px; font-size: 13px; font-weight: 600; color: var(--muted); white-space: nowrap; }
 .seg input:checked + span { background: var(--panel); color: var(--fg); box-shadow: 0 0 0 1px var(--line); }
 .seg input:focus-visible + span { outline: 2px solid var(--accent); outline-offset: 1px; }
+.seg-src { margin-top: 12px; }
+.seg-src span { padding: 11px 6px; font-size: 14.5px; }
+.src-hint { margin: 10px 0 2px; font-size: 13px; color: var(--muted); }
 .switch { position: relative; display: inline-flex; width: 54px; height: 32px; flex: none; }
 .switch input { position: absolute; inset: 0; opacity: 0; margin: 0; cursor: pointer; z-index: 1; }
 .switch span { position: absolute; inset: 0; background: var(--track); border-radius: 99px; transition: background .2s; border: 1px solid var(--line); }
@@ -527,6 +530,20 @@ select.sel {
     <section class="view" id="view-settings" aria-label="設定" hidden>
       <div class="cards">
         <article class="card">
+          <h2>速度の測り方</h2>
+          <div class="seg seg-src">
+            <label><input type="radio" name="s-source" value="gps" data-key="source"><span>GPS + センサー</span></label>
+            <label><input type="radio" name="s-source" value="sensor" data-key="source"><span>センサーのみ</span></label>
+          </div>
+          <p class="src-hint" id="source-hint"></p>
+          <div class="row">
+            <div class="lbl"><b>センサーの学習</b><small id="dr-status">--</small></div>
+            <button class="btn small" type="button" id="btn-dr-reset">やり直す</button>
+          </div>
+          <p class="fine">センサーを使うときは、スマホをホルダーにしっかり固定してください。手に持ったり向きを変えたりすると、学習は最初からになります。センサーで出した速度は数字が青くなり、時間がたつほどずれやすいので目安として使ってください。</p>
+        </article>
+
+        <article class="card">
           <h2>車と燃料</h2>
           <div class="row">
             <div class="lbl"><b>車の燃費</b><small>トリップの推定燃料とガソリン代に使います</small></div>
@@ -566,19 +583,6 @@ select.sel {
             <div class="lbl"><b>警告音</b><small>超えた瞬間に2回鳴ります</small></div>
             <label class="switch"><input type="checkbox" id="s-beep" data-key="beep" aria-label="警告音"><span></span></label>
           </div>
-        </article>
-
-        <article class="card">
-          <h2>GPSが切れたとき（トンネル）</h2>
-          <div class="row">
-            <div class="lbl"><b>センサーで速度を推定</b><small>GPSが切れたら、スマホの加速度センサーで速度を推定して表示を続けます。推定中は数字が青くなります。</small></div>
-            <label class="switch"><input type="checkbox" id="s-dr" data-key="dr" aria-label="センサーで速度を推定"><span></span></label>
-          </div>
-          <div class="row">
-            <div class="lbl"><b>センサーの学習</b><small id="dr-status">--</small></div>
-            <button class="btn small" type="button" id="btn-dr-reset">やり直す</button>
-          </div>
-          <p class="fine">学習は、GPSが使える場所で加速や減速をするうちに自動で進みます（数分ほど）。スマホはホルダーにしっかり固定してください。手に持ったり向きを変えたりすると、学習は最初からになります。推定値は時間がたつほどずれやすいので、目安として使ってください。</p>
         </article>
 
         <article class="card">
@@ -674,9 +678,10 @@ select.sel {
   const DEFAULTS = {
     kmL: 15, basis: 'manual', price: 175, fuel: 'gasoline',
     limitOn: false, limit: 100, beep: true,
-    gaugeMax: 180, calib: 0, theme: 'dark', wake: true, hudMirror: false, dr: true,
+    gaugeMax: 180, calib: 0, theme: 'dark', wake: true, hudMirror: false, source: 'gps',
   };
   const S = Object.assign({}, DEFAULTS, store.get(KEY.s, {}));
+  if (S.source !== 'gps' && S.source !== 'sensor') S.source = 'gps';
   const saveS = () => store.set(KEY.s, S);
   const freshTrip = () => ({ dist: 0, elapsed: 0, moving: 0, max: 0, running: true });
   let T = Object.assign(freshTrip(), store.get(KEY.t, {}));
@@ -917,6 +922,7 @@ select.sel {
     A: [[0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]], B: [0, 0, 0, 0],
     sw: 0, sy: 0, syy: 0, exc: 0, theta: null, r2: 0, ok: false,
     gravRef: null, still: null, move: null,
+    F: null, evMag: 0, evN: 0, selfTheta: null, selfOk: false, selfCons: 0,
   });
   let L = Object.assign(freshLearn(), store.get(KEY_LEARN, {}));
   let learnSavedAt = 0;
@@ -1014,23 +1020,36 @@ select.sel {
     }
   }
 
-  // GPSが切れている間、250ms ごとに速度を更新する
+  // 前後方向の向き: GPSで学習したもの、無ければ発進・停止から学習したもの
+  const fwd = () => (L.ok && L.theta ? L.theta : L.selfOk && L.selfTheta ? L.selfTheta : null);
+  const sensorOnly = () => mode === 'sensor' || (mode === 'demo' && !!demo && demo.sensorOnly);
+  const dot3 = (th, m) => th[0] * m[0] + th[1] * m[1] + th[2] * m[2];
+  // 揺れがこれより小さければ「止まっている」とみなす
+  function stillThreshold() {
+    if (L.still != null && L.move != null && L.move > L.still * 1.5) return Math.sqrt(L.still * L.move);
+    if (L.still != null) return Math.max(L.still * 2.5, L.still + 0.03);
+    return null;
+  }
+
+  // 250ms ごとに、GPSが切れているとき（または「センサーのみ」のとき）の速度を更新する
   function drTick() {
     const now = performance.now();
     const win = M.dn ? M.ds.map((v) => v / M.dn) : null;
     M.ds = [0, 0, 0]; M.dn = 0;
     checkMount();
+    if (sensorOnly()) { sensorTick(now, win); return; }
     const lost = (mode === 'gps' || mode === 'demo') && hasFix && now - lastFixAt > 2500;
-    if (!lost || !S.dr || !motionLive()) {
-      if (dr && (mode === 'off' || !S.dr || !motionLive())) { dr = null; render(); }
+    if (!lost || !motionLive()) {
+      if (dr && (mode === 'off' || !motionLive())) { dr = null; render(); }
       return;
     }
+    const F = fwd();
     if (!dr) {
       // 最後のGPS速度から始めて、それ以降に受けた加速度もさかのぼって足す
       let v0 = last && last.vr != null ? last.vr : spd / 3.6;
-      if (L.ok && M.fn >= 5) {
-        const th = L.theta, m = M.fs.map((x) => x / M.fn);
-        v0 += (th[0] * m[0] + th[1] * m[1] + th[2] * m[2] + th[3]) * ((now - lastFixAt) / 1000);
+      if (F && M.fn >= 5) {
+        const m = M.fs.map((x) => x / M.fn);
+        v0 += (dot3(F, m) + F[3]) * ((now - lastFixAt) / 1000);
       }
       // 推定開始までの数秒の距離は、出口でトンネルの入口との直線距離から補正される
       dr = { since: now, t: now, v: Math.max(0, v0), anchor: last, distStart: T.dist, stillFor: 0, stopped: false, unknown: false };
@@ -1040,16 +1059,13 @@ select.sel {
     if (now - dr.since > 20 * 60000) dr.unknown = true;      // 20分を超えたら推定をやめる
     if (dr.unknown) { render(); return; }
 
-    if (L.ok && win) {
-      const th = L.theta;
-      dr.v += (th[0] * win[0] + th[1] * win[1] + th[2] * win[2] + th[3]) * dt;
-    }
+    if (F && win) dr.v += (dot3(F, win) + F[3]) * dt;
     // 停車の判定: 揺れが「止まっているとき」に近ければ 0 km/h にする
-    if (L.still != null && L.move != null && M.vib != null && L.move > L.still * 1.5) {
-      const thr = Math.sqrt(L.still * L.move);
+    const thr = stillThreshold();
+    if (thr != null && M.vib != null) {
       dr.stillFor = M.vib < thr ? dr.stillFor + dt : 0;
-      if (dr.stillFor >= 2) { dr.v = 0; dr.stopped = true; }
-      else if (!L.ok && dr.stopped && M.vib >= thr) dr.unknown = true;   // 学習前に動き出すと速度は分からない
+      if (dr.stillFor >= 2 && (!F || dr.v < 5.5 || dr.stillFor >= 10)) { dr.v = 0; dr.stopped = true; }
+      else if (!F && dr.stopped && M.vib >= thr) dr.unknown = true;   // 学習前に動き出すと速度は分からない
     }
     dr.v = Math.min(Math.max(dr.v, 0), 85);
     spd = dr.v * 3.6;
@@ -1060,6 +1076,103 @@ select.sel {
     render();
   }
   setInterval(drTick, 250);
+
+  // ---------- センサーのみの計測 ----------
+  // 加速度を積み上げて速度を出す。止まるたびに 0 km/h に戻し、そのとき残っていた速度を
+  // センサーのかたより（バイアス）として次から差し引く。
+  let SN = null;
+  const freshSN = (now) => ({ t: now, start: now, v: 0, stillFor: 0, moving: false, zeroAt: now, seg: 0, base: [], vibT: -1, hb: [], cap: null });
+
+  // 発進・停止のときの水平方向の加速度から、スマホの前後方向を学習する（GPSなし）
+  function selfEvent(v, sign) {
+    const mag = Math.hypot(v[0], v[1], v[2]);
+    if (mag < 0.3) return;                       // 弱すぎる加減速は使わない
+    if (!L.F) { L.F = [0, 0, 0]; L.evMag = 0; L.evN = 0; }
+    L.F = L.F.map((x, i) => x + sign * v[i]);
+    L.evMag += mag;
+    L.evN++;
+    const fm = Math.hypot(L.F[0], L.F[1], L.F[2]);
+    L.selfCons = fm / L.evMag;
+    L.selfOk = L.evN >= 4 && L.selfCons >= 0.6;
+    if (L.selfOk) L.selfTheta = [L.F[0] / fm, L.F[1] / fm, L.F[2] / fm, L.selfTheta ? L.selfTheta[3] : 0];
+    saveLearn();
+  }
+
+  function sensorTick(now, win) {
+    if (!SN) SN = freshSN(now);
+    const dt = Math.min((now - SN.t) / 1000, 1);
+    SN.t = now;
+    if (!motionLive()) { render(); return; }
+    const fresh = M.vib != null && M.vibT !== SN.vibT;     // 揺れの値は1秒ごとに更新される
+    if (fresh) SN.vibT = M.vibT;
+    // 計測を始めた直後の数秒（停車中）の揺れを「止まっているとき」の基準にする
+    if (L.still == null && fresh) {
+      SN.base.push(M.vib);
+      if (now - SN.start > 3000) { const s = SN.base.slice().sort((a, b) => a - b); L.still = s[Math.floor(s.length / 2)]; }
+    }
+    const thr = stillThreshold();
+    const isStill = thr != null && M.vib != null && M.vib < thr;
+    SN.stillFor = isStill ? SN.stillFor + dt : 0;
+
+    // 水平方向の加速度（重力の向きの成分を除く）を8秒分ためておく
+    if (win) {
+      let h = win;
+      if (M.grav) {
+        const n = Math.hypot(M.grav[0], M.grav[1], M.grav[2]);
+        if (n > 5) { const g = M.grav.map((x) => x / n), d = dot3(g, win); h = win.map((x, i) => x - d * g[i]); }
+      }
+      SN.hb.push({ t: now, h });
+      while (SN.hb.length && now - SN.hb[0].t > 8000) SN.hb.shift();
+      if (SN.cap) {
+        SN.cap.sum = SN.cap.sum.map((x, i) => x + h[i]);
+        SN.cap.n++;
+        if (now >= SN.cap.until) {
+          if (SN.cap.n >= 6) selfEvent(SN.cap.sum.map((x) => x / SN.cap.n), +1);   // 発進直後は前へ加速している
+          SN.cap = null;
+        }
+      }
+    }
+
+    const F = fwd();
+    if (F && win) SN.v += (dot3(F, win) + F[3]) * dt;
+
+    if (SN.stillFor >= 2 && (!F || SN.v < 5.5 || SN.stillFor >= 10)) {
+      if (SN.moving) {
+        const span = (now - SN.zeroAt) / 1000;
+        if (F && span > 8) {
+          // 止まったのに残っている速度は、センサーのかたよりによる誤差
+          F[3] = Math.max(-0.3, Math.min(0.3, F[3] - 0.5 * (SN.v / span)));
+          if (T.running) {
+            const over = 0.5 * SN.v * span;        // 誤差で多く（少なく）数えた距離 (m)
+            T.dist = Math.max(0, T.dist - Math.max(-0.5 * SN.seg, Math.min(0.5 * SN.seg, over)) / 1000);
+          }
+        }
+        // 止まる直前は減速していたはず
+        const pre = SN.hb.filter((e) => now - e.t >= 3000 && now - e.t <= 7000);
+        if (!L.ok && span > 6 && pre.length >= 8) {
+          selfEvent([0, 1, 2].map((i) => pre.reduce((a, e) => a + e.h[i], 0) / pre.length), -1);
+        }
+        SN.moving = false;
+      }
+      if (fresh && isStill) L.still += 0.05 * (M.vib - L.still);
+      SN.v = 0; SN.zeroAt = now; SN.seg = 0;
+    } else if (!SN.moving && thr != null && !isStill) {
+      SN.moving = true;
+      SN.zeroAt = now; SN.seg = 0;
+      if (!L.ok) SN.cap = { until: now + 3000, sum: [0, 0, 0], n: 0 };
+    }
+
+    SN.v = Math.max(-20, Math.min(70, SN.v));
+    const vpos = Math.max(0, SN.v);
+    spd = vpos * 3.6;
+    if (T.running && F) {
+      T.dist += (vpos * dt) / 1000;
+      SN.seg += vpos * dt;
+      if (spd >= 3) T.moving += dt;
+      if (spd > T.max) T.max = spd;
+    }
+    render();
+  }
 
   // GPSが戻ったら、推定した距離をトンネルの入口と出口の直線距離で補正する
   function endDR(f) {
@@ -1085,14 +1198,16 @@ select.sel {
     if (noticeKind === 'motion') hideNotice();
   }
   function enableMotion(fromGesture) {
-    if (!S.dr || M.state === 'on' || M.state === 'asking') return;
+    if (M.state === 'on' || M.state === 'asking') return;
     if (typeof window.DeviceMotionEvent === 'undefined') { M.state = 'unsupported'; return; }
     if (!needsMotionPermission()) { attachMotion(); return; }
     if (!fromGesture) { M.state = 'needTap'; return; }   // iPhone は画面をタップしたときにしか許可を求められない
     M.state = 'asking';
     const denied = () => {
       M.state = 'denied';
-      if (noticeKind === 'motion') showNotice('センサーの利用が許可されなかったため、トンネルでは速度を推定できません。GPSの速度表示はそのまま使えます。', false, 'motion-denied');
+      if (noticeKind === 'motion') showNotice(S.source === 'sensor'
+        ? 'センサーの利用が許可されなかったため、「センサーのみ」では測れません。設定で「GPS + センサー」を選ぶとGPSで測れます。'
+        : 'センサーの利用が許可されなかったため、トンネルでは速度を推定できません。GPSの速度表示はそのまま使えます。', false, 'motion-denied');
     };
     window.DeviceMotionEvent.requestPermission()
       .then((r) => { if (r === 'granted') attachMotion(); else denied(); })
@@ -1101,14 +1216,19 @@ select.sel {
   document.addEventListener('click', () => { if (M.state === 'needTap' && mode !== 'off') enableMotion(true); }, true);
 
   function drStatusText() {
-    if (!S.dr) return 'オフにしています';
     if (M.state === 'unsupported') return 'この端末・ブラウザではセンサーを使えません';
     if (M.state === 'denied') return 'センサーの利用が許可されていません。ブラウザのサイト設定で「モーションと画面の向き」を許可してから開き直してください。';
     if (M.state === 'needTap') return '画面をタップするとセンサーを使い始めます';
-    if (mode === 'off') return '「GPSを開始」を押すとセンサーを使い始めます';
-    if (!M.linear) return 'この端末は重力を除いた加速度を出さないため、推定できません';
-    if (!motionLive()) return 'センサーの値が届いていません（端末によっては使えません）';
     if (L.ok) return `学習済み（GPSとの一致度 ${Math.round(L.r2 * 100)}%）`;
+    if (L.selfOk) return `学習済み（発進・停止 ${L.evN} 回から）`;
+    if (mode === 'off') return `まだ学習していません。「${S.source === 'sensor' ? '計測を開始' : 'GPSを開始'}」を押して走ると学習が始まります。`;
+    if (!M.linear) return 'この端末は重力を除いた加速度を出さないため、使えません';
+    if (!motionLive()) return 'センサーの値が届いていません（端末によっては使えません）';
+    if (sensorOnly()) {
+      const n = L.evN || 0;
+      if (n >= 4) return '学習中：発進・停止のデータがばらついています。スマホがしっかり固定されているか確かめてください。';
+      return `学習中：停車からの発進と停止を、あと${4 - n}回ほど行うと測れるようになります。先に「GPS + センサー」で数分走っておくと、すぐに測れます。`;
+    }
     const pct = Math.min(95, Math.round((L.exc / 12) * 100));
     return `学習中 ${pct}%。加速や減速をするうちに進みます。学習が終わるまでは、GPSが切れる直前の速度を表示します。`;
   }
@@ -1132,11 +1252,31 @@ select.sel {
     updateControls();
     render();
   }
-  function stopGPS() {
+  function startSensor(fromGesture) {
+    unlockAudio();
+    if (mode === 'demo') stopDemo();
+    if (watchId != null) { navigator.geolocation.clearWatch(watchId); watchId = null; }
+    resetFix();
+    resetMotion();
+    mode = 'sensor';
+    SN = freshSN(performance.now());
+    enableMotion(!!fromGesture);
+    if (M.state === 'needTap') showNotice('センサーで速度を測るために、画面のどこかをタップしてください。', false, 'motion');
+    else if (M.state === 'unsupported') showNotice('この端末・ブラウザでは加速度センサーを使えないため、「センサーのみ」では測れません。設定で「GPS + センサー」を選んでください。');
+    requestWake();
+    updateControls();
+    render();
+  }
+  function startMeasure(fromGesture) {
+    hideNotice();
+    if (S.source === 'sensor') startSensor(fromGesture); else startGPS(fromGesture);
+  }
+  function stopMeasure() {
     if (watchId != null) navigator.geolocation.clearWatch(watchId);
     watchId = null;
-    if (mode === 'gps') mode = 'off';
+    if (mode === 'gps' || mode === 'sensor') mode = 'off';
     dr = null;
+    SN = null;
     releaseWake();
     updateControls();
     render();
@@ -1148,7 +1288,7 @@ select.sel {
   function onErr(e) {
     if (e.code === 1) {
       showNotice('位置情報の利用が許可されていません。ブラウザの設定でこのサイトの位置情報を「許可」にしてから、もう一度「GPSを開始」を押してください。');
-      stopGPS();
+      stopMeasure();
       return;
     }
     if (e.code === 2) showNotice('現在地を取得できません。空が見える場所で少し待つと測位が始まります。', true);
@@ -1167,7 +1307,9 @@ select.sel {
     for (const [until, v] of DEMO_PLAN) if (c < until) return v;
     return 0;
   }
-  function startDemo() {
+  function startDemo(opts) {
+    opts = opts || {};
+    hideNotice();
     unlockAudio();
     if (watchId != null) { navigator.geolocation.clearWatch(watchId); watchId = null; }
     if (mode !== 'demo') { demoBackup = JSON.parse(JSON.stringify(T)); learnBackup = JSON.parse(JSON.stringify(L)); }
@@ -1176,12 +1318,18 @@ select.sel {
     resetFix();
     resetMotion();
     mode = 'demo';
-    demo = { lat: 35.68124, lon: 139.76712, v: 0, a: 0, hd: 28, t0: Date.now(), tunnel: false };
+    demo = { lat: 35.68124, lon: 139.76712, v: 0, a: 0, hd: 28, t0: Date.now(), tunnel: false, sensorOnly: S.source === 'sensor' };
+    SN = demo.sensorOnly ? freshSN(performance.now()) : null;
+    if (demo.sensorOnly && opts.seed !== false) {
+      // 「GPS + センサー」で学習を済ませてある想定で始める（かたよりの補正は少しずれた状態）
+      L.theta = [DEMO_AXIS[0], DEMO_AXIS[1], DEMO_AXIS[2], -0.015];
+      L.ok = true; L.r2 = 0.99; L.exc = 30;
+    }
     const step = () => {
       const el = (Date.now() - demo.t0) / 1000;
       const c = el % DEMO_CYCLE;
-      demo.tunnel = c >= DEMO_TUNNEL[0] && c < DEMO_TUNNEL[1];
-      if (!demo.tunnel) ingest({ lat: demo.lat, lon: demo.lon, acc: 5, speed: demo.v / 3.6, heading: demo.hd, t: Date.now() });
+      demo.tunnel = !demo.sensorOnly && c >= DEMO_TUNNEL[0] && c < DEMO_TUNNEL[1];
+      if (!demo.tunnel && !demo.sensorOnly) ingest({ lat: demo.lat, lon: demo.lon, acc: 5, speed: demo.v / 3.6, heading: demo.hd, t: Date.now() });
       // 次の1秒の加速度を決めて進める
       let dv = Math.max(-4.2, Math.min(2.8, demoTarget(el + 1) - demo.v));
       if (demo.v > 5) dv += (Math.random() - 0.5) * 1.2;
@@ -1200,9 +1348,9 @@ select.sel {
       const side = moving ? Math.sin(Date.now() / 1300) * 0.3 : 0;
       const f = DEMO_AXIS, s = DEMO_SIDE;
       addMotion(
-        f[0] * demo.a + s[0] * side + rn() * nz,
-        f[1] * demo.a + s[1] * side + rn() * nz,
-        f[2] * demo.a + s[2] * side + rn() * nz,
+        f[0] * (demo.a + 0.03) + s[0] * side + rn() * nz,      // 0.03 m/s² はセンサーのかたより
+        f[1] * (demo.a + 0.03) + s[1] * side + rn() * nz,
+        f[2] * (demo.a + 0.03) + s[2] * side + rn() * nz,
         DEMO_GRAV);
     };
     step();
@@ -1219,6 +1367,7 @@ select.sel {
     if (mode !== 'demo') return;
     clearInterval(demoTimer); demoTimer = null;
     clearInterval(demoFeel); demoFeel = null;
+    SN = null;
     T = demoBackup || freshTrip();
     demoBackup = null;
     if (learnBackup) L = Object.assign(freshLearn(), learnBackup);
@@ -1239,8 +1388,11 @@ select.sel {
   // ---------- 表示 ----------
   function render() {
     const now = performance.now();
-    const est = !!dr && !dr.unknown;            // センサーで推定中
-    const stale = mode === 'off' || !hasFix || (dr ? dr.unknown : now - lastFixAt > 6000);
+    const sOnly = sensorOnly();
+    const F = fwd();
+    const sReady = sOnly && !!SN && motionLive() && !!F;
+    const est = sOnly ? sReady : (!!dr && !dr.unknown);      // センサーで推定中
+    const stale = mode === 'off' || (sOnly ? !sReady : (!hasFix || (dr ? dr.unknown : now - lastFixAt > 6000)));
     const k = 1 + (S.calib || 0) / 100;
     const v = stale ? 0 : spd * k;
     const vr = Math.round(v);
@@ -1267,8 +1419,11 @@ select.sel {
     document.documentElement.classList.toggle('is-over', over);
     $('hud').classList.toggle('over', over);
 
-    $('g-dir').textContent = est ? (L.ok ? 'センサーで推定中' : '直前の速度で推定中')
-      : !stale && headingDeg != null && spd >= 5 ? `${dirName(headingDeg)}へ` : '';
+    let dirText = '';
+    if (sOnly) dirText = !SN || (now - SN.start < 2500 && !motionLive()) ? '' : !motionLive() ? 'センサーが使えません' : !F ? '学習中（発進と停止で学習）' : 'センサーのみで計測';
+    else if (est) dirText = F ? 'センサーで推定中' : '直前の速度で推定中';
+    else if (!stale && headingDeg != null && spd >= 5) dirText = `${dirName(headingDeg)}へ`;
+    $('g-dir').textContent = dirText;
 
     // トリップ
     $('t-dist').textContent = fmtDist(T.dist);
@@ -1292,9 +1447,16 @@ select.sel {
     // GPS 状態
     const pill = $('gps');
     let level, text, acc = '';
-    if (est) { level = 'est'; text = mode === 'demo' ? 'デモ・トンネル内' : 'GPSなし・推定中'; }
+    if (sOnly) {
+      if (mode === 'demo') { level = 'est'; text = 'デモ・センサーのみ'; }
+      else if (SN && now - SN.start < 2500 && !motionLive()) { level = 'wait'; text = '準備中…'; }
+      else if (!motionLive()) { level = M.state === 'needTap' ? 'wait' : 'lost'; text = M.state === 'needTap' ? 'タップで開始' : 'センサーなし'; }
+      else if (!F) { level = 'wait'; text = 'センサー学習中'; }
+      else { level = 'est'; text = 'センサー計測'; }
+    }
+    else if (est) { level = 'est'; text = mode === 'demo' ? 'デモ・トンネル内' : 'GPSなし・推定中'; }
     else if (mode === 'demo') { level = 'demo'; text = 'デモ走行'; }
-    else if (mode === 'off') { level = 'off'; text = 'GPS 停止中'; }
+    else if (mode === 'off') { level = 'off'; text = S.source === 'sensor' ? '計測停止中' : 'GPS 停止中'; }
     else if (!hasFix) { level = 'wait'; text = '測位中…'; }
     else if (now - lastFixAt > 6000) {
       if (now - lastAnyAt < 6000 && lastAnyAcc != null) { level = 'poor'; text = 'GPS 弱い'; acc = `±${Math.round(lastAnyAcc)} m`; }
@@ -1317,7 +1479,7 @@ select.sel {
 
   function updateControls() {
     const main = $('btn-main');
-    if (mode === 'off') { main.textContent = 'GPSを開始'; main.className = 'btn primary'; }
+    if (mode === 'off') { main.textContent = S.source === 'sensor' ? '計測を開始' : 'GPSを開始'; main.className = 'btn primary'; }
     else if (T.running) { main.textContent = '一時停止'; main.className = 'btn'; }
     else { main.textContent = '記録を再開'; main.className = 'btn primary'; }
     $('btn-demo-end').hidden = mode !== 'demo';
@@ -1366,7 +1528,7 @@ select.sel {
 
   // ---------- メーター操作 ----------
   $('btn-main').addEventListener('click', () => {
-    if (mode === 'off') { startGPS(true); return; }
+    if (mode === 'off') { startMeasure(true); return; }
     T.running = !T.running;
     anchor = null;               // 一時停止中の移動は距離に入れない
     if (dr) dr.anchor = null;
@@ -1427,9 +1589,20 @@ select.sel {
   window.matchMedia('(prefers-color-scheme: light)').addEventListener?.('change', () => { if (S.theme === 'auto') applyTheme(); });
 
   // ---------- 設定 ----------
+  const SOURCE_HINT = {
+    gps: 'ふだんはGPSで測り、トンネルなどでGPSが切れたときだけ加速度センサーで推定します。いちばん正確です。',
+    sensor: 'GPSを使わず、加速度センサーだけで測ります。止まるたびに誤差をリセットしますが、止まらずに長く走るほどずれやすくなります。計測は停車中に開始してください。',
+  };
+  function updateSourceHint() { $('source-hint').textContent = SOURCE_HINT[S.source]; }
   function applySettings(key) {
     if (key === 'theme') applyTheme();
-    if (key === 'dr') { if (S.dr) enableMotion(true); else dr = null; }
+    if (key === 'source') {
+      updateSourceHint();
+      if (mode === 'demo') stopDemo();
+      else if (mode !== 'off') { stopMeasure(); startMeasure(true); }
+      updateControls();
+      $('dr-status').textContent = drStatusText();
+    }
     if (key === 'gaugeMax') buildGauge();
     if (key === 'limit' || key === 'limitOn') updateLimitMark();
     if (key === 'wake') { if (S.wake) requestWake(); else releaseWake(); }
@@ -1610,6 +1783,7 @@ select.sel {
 
   // ---------- 起動 ----------
   $('f-date').value = todayISO();
+  updateSourceHint();
   applyTheme();
   applyMirror();
   buildGauge();
@@ -1622,7 +1796,7 @@ select.sel {
   // すでに位置情報が許可されていれば自動で開始
   if (navigator.permissions && navigator.permissions.query) {
     navigator.permissions.query({ name: 'geolocation' }).then((st) => {
-      if (st.state === 'granted' && mode === 'off') startGPS(false);
+      if (st.state === 'granted' && mode === 'off' && S.source === 'gps') startGPS(false);
     }).catch(() => {});
   }
 
@@ -1633,7 +1807,7 @@ select.sel {
   // テスト・デバッグ用
   window.__drivemeter = {
     ingest, startDemo, stopDemo,
-    state: () => ({ mode, T, spd, hasFix, dr: dr && { v: dr.v, unknown: dr.unknown }, learn: { ok: L.ok, r2: L.r2, exc: L.exc, still: L.still, move: L.move, theta: L.theta }, demoV: demo && demo.v, tunnel: demo && demo.tunnel, motion: M.state }),
+    state: () => ({ mode, T, spd, hasFix, dr: dr && { v: dr.v, unknown: dr.unknown }, learn: { ok: L.ok, r2: L.r2, exc: L.exc, still: L.still, move: L.move, theta: L.theta }, demoV: demo && demo.v, tunnel: demo && demo.tunnel, motion: M.state, source: S.source, sn: SN && { v: SN.v, moving: SN.moving, stillFor: SN.stillFor }, self: { ok: L.selfOk, n: L.evN, cons: L.selfCons, theta: L.selfTheta } }),
   };
 })();
 </script>
